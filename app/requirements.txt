@@ -4,7 +4,7 @@ fastapi~=0.142.2
 # because it carries the fixed code for seven advisories open at 0.46.2; 1.3.1 is
 # the lowest version that closes all seven, 1.6.0 is what this was validated
 # against. fastapi~=0.142.2 already allows starlette>=1.0 (the <0.133 cap is gone),
-# so this pin only tightens the floor to the patched line — everything else stays
+# so this pin only tightens the floor to the patched line; everything else stays
 # on its normal range and can move with Dependabot.
 #   CVE-2026-48710  Host-header routing confusion  (CISA KEV)  -> fixed 1.0.1
 #   CVE-2026-48817  HTTPEndpoint getattr method dispatch       -> fixed 1.1.0
@@ -22,3 +22,17 @@ pydantic~=2.13
 asyncpg~=0.31.0
 markdown>=3.11
 xhtml2pdf>=0.2.21
+
+# Pillow is an indirect dependency (xhtml2pdf -> reportlab -> Pillow). From 12.3
+# Pillow publishes Linux wheels only for manylinux_2_28 (glibc >= 2.28); on an
+# older container pip falls back to a source build that needs libjpeg/zlib
+# headers and fails with "Failed building wheel for pillow". 12.2.0 is the last
+# release with a manylinux2014 (glibc 2.17) wheel for CPython 3.11, so this cap
+# keeps the install wheel-only on any runtime. Verified 2026-11-03: every other
+# pin in this file resolves to a manylinux2014 wheel for CPython 3.11. Safe to
+# drop once the Apps runtime is confirmed at glibc >= 2.28 (Ubuntu 22.04 is).
+pillow<12.3
+
+# Keep this file ASCII-only: pip decodes requirements.txt with the container's
+# preferred locale encoding, and a non-UTF-8 locale turns a stray non-ASCII
+# character in a comment into a UnicodeDecodeError at install time.

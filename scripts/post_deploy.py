@@ -30,6 +30,7 @@ history steps additionally require asyncpg.
 
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -60,6 +61,8 @@ WAREHOUSE_ID = os.environ.get("WAREHOUSE_ID", os.environ.get("DATABRICKS_WAREHOU
 USE_LAKEBASE = os.environ.get("USE_LAKEBASE", "false").lower() == "true"
 LAKEBASE_INSTANCE = os.environ.get("LAKEBASE_INSTANCE_NAME", "")
 LAKEBASE_DATABASE = os.environ.get("LAKEBASE_DATABASE", "ontology_readiness")
+if not re.fullmatch(r"[a-z_][a-z0-9_]*", LAKEBASE_DATABASE):
+    sys.exit(f"ERROR: LAKEBASE_DATABASE={LAKEBASE_DATABASE!r} must match [a-z_][a-z0-9_]*")
 # These provisioning connections carry a live Lakebase credential over the public
 # internet. `require` encrypts but verifies nothing, so it gives no protection
 # against an in-path attacker — see app/server/lakebase_client.py for the runtime
@@ -101,9 +104,9 @@ def render_app_yml():
 
     def set_env(name: str, value: str) -> None:
         nonlocal text
-        import re
         pattern = rf'(- name: {name}\n\s+value: ")[^"]*(")'
-        text, n = re.subn(pattern, rf"\g<1>{value}\g<2>", text)
+        safe = value.replace("\\", "\\\\").replace('"', '\\"')
+        text, n = re.subn(pattern, lambda m: m.group(1) + safe + m.group(2), text)
         if n == 0:
             print(f"  (warning) could not set {name} in app.yml — leaving template default")
 
@@ -165,6 +168,80 @@ def cli(*args, check=True):
     if check and result.returncode != 0:
         print(f"  command failed ({result.returncode})")
     return result.returncode
+
+
+def deployment_status(app_name):
+    """Return (app_state, deployment_state, deployment_message, url, source_path) from `apps get`.
+
+    `bundle run` on an app resource only reports a non-zero exit; the reason lives
+    in active_deployment.status.message (e.g. "Error installing packages"). Read it
+    so the operator sees the actual failure instead of a guess."""
+    app = cli_json("apps", "get", app_name)
+    if not isinstance(app, dict):
+        return "", "", "", "", ""
+    # pending_deployment first: after a failed redeploy of a running app,
+    # active_deployment is still the previous *successful* one.
+    dep = app.get("pending_deployment") or app.get("active_deployment") or {}
+    dep_status = dep.get("status") or {}
+    app_status = app.get("app_status") or {}
+    return (app_status.get("state", ""), dep_status.get("state", ""),
+            dep_status.get("message", ""), app.get("url", ""),
+            dep.get("source_code_path", ""))
+
+
+def explain_deploy_failure(app_name, dep_state, dep_message, source_path=""):
+    """Print what failed and exactly where the evidence is.
+
+    The install log is only reachable with a user OAuth token (CLI `apps logs` or
+    the app's /logz page), never through the REST API, so point the operator
+    there rather than speculating about the cause."""
+    print(f"\n  DEPLOYMENT {dep_state or 'FAILED'}: {dep_message or '(no status message)'}")
+    if "installing packages" in (dep_message or "").lower():
+        print("  The Apps runtime failed while running `pip install -r requirements.txt`.")
+        print("  This is a dependency or network problem inside the app container, not a")
+        print("  bundle variable problem. The first error line in the log decides which:")
+        print("    - 'Could not fetch URL' / timeout  -> workspace egress blocks PyPI")
+        print("    - 'Failed building wheel for X'     -> no prebuilt wheel for the runtime; pin X lower")
+        print("    - 'No matching distribution for X'  -> pin does not exist for Python 3.11")
+        print("    - 'ResolutionImpossible'            -> conflicting pins; relax the named ones")
+    print("  Read the log (needs your OAuth profile, not a PAT):")
+    print(f"    databricks apps logs {app_name}" + (f" --profile {PROFILE}" if PROFILE else ""))
+    print("    or open <app URL>/logz in a browser.")
+    print("  After fixing, redeploy the already-synced code without re-running Terraform:")
+    print(f"    databricks apps deploy {app_name} --source-code-path "
+          f"{source_path or '<active_deployment.source_code_path>'}"
+          + (f" --profile {PROFILE}" if PROFILE else ""))
+
+
+def update_app(extra_resources=()):
+    """Re-assert the `sql` user scope (OBO) and add any extra resources, preserving
+    the app's existing resources and description. `bundle deploy` only applies
+    user_api_scopes on create, so an app created before the scope existed needs
+    this on every run, Lakebase or not. Returns True on success."""
+    app = cli_json("apps", "get", APP_NAME)
+    if not isinstance(app, dict):
+        print(f"  WARNING: could not read app {APP_NAME}; user_api_scopes not asserted")
+        return False
+    resources = []
+    for r in app.get("resources", []):
+        item = {"name": r["name"]}
+        for k in ("sql_warehouse", "database", "secret", "serving_endpoint", "job"):
+            if r.get(k) is not None:
+                item[k] = r[k]
+        resources.append(item)
+    names = {r["name"] for r in resources}
+    resources += [r for r in extra_resources if r["name"] not in names]
+    payload = {"name": APP_NAME, "resources": resources, "user_api_scopes": ["sql"]}
+    if app.get("description"):
+        payload["description"] = app["description"]
+    # Retry: `apps update` can transiently conflict right after `bundle run`.
+    for _ in range(6):
+        if cli_json("apps", "update", APP_NAME, "--json", json.dumps(payload)):
+            print(f"  user_api_scopes: sql   resources: {', '.join(r['name'] for r in resources)}")
+            return True
+        time.sleep(10)
+    print("  WARNING: apps update failed after retries (user_api_scopes / resources not applied)")
+    return False
 
 
 def _fallback_app_name():
@@ -282,34 +359,14 @@ def attach_lakebase():
     sp = _LAKEBASE.get("sp_client_id")
     user_email = _LAKEBASE.get("user_email", "")
     if not host:
-        return
+        return True
     print("\n[Lakebase] Attaching lakebase-db resource (post-publish)")
-    app = cli_json("apps", "get", APP_NAME)
-    resources = []
-    for r in (app.get("resources", []) if isinstance(app, dict) else []):
-        item = {"name": r["name"]}
-        for k in ("sql_warehouse", "database", "secret", "serving_endpoint", "job"):
-            if r.get(k) is not None:
-                item[k] = r[k]
-        resources.append(item)
-    if not any(r["name"] == "lakebase-db" for r in resources):
-        resources.append({
-            "name": "lakebase-db",
-            "database": {"instance_name": LAKEBASE_INSTANCE,
-                         "database_name": LAKEBASE_DATABASE,
-                         "permission": "CAN_CONNECT_AND_CREATE"},
-        })
-    # Retry: `apps update` can transiently conflict right after `bundle run`.
-    # Also (re)assert user_api_scopes so on-behalf-of-user (OBO) auth is enabled on
-    # an already-created app — user_api_scopes is otherwise only applied on create.
-    payload = json.dumps({"resources": resources, "user_api_scopes": ["sql"]})
-    res = None
-    for attempt in range(6):
-        res = cli_json("apps", "update", APP_NAME, "--json", payload)
-        if res:
-            break
-        time.sleep(10)
-    print(f"  resources: {', '.join(r['name'] for r in resources)}" if res else "  WARNING: apps update failed after retries")
+    ok = update_app([{
+        "name": "lakebase-db",
+        "database": {"instance_name": LAKEBASE_INSTANCE,
+                     "database_name": LAKEBASE_DATABASE,
+                     "permission": "CAN_CONNECT_AND_CREATE"},
+    }])
 
     # Grant the app SP full DML on the history objects. Schema USAGE/CREATE alone
     # is NOT enough when the tables/sequences already exist owned by another role
@@ -348,9 +405,11 @@ def attach_lakebase():
     if isinstance(app, dict):
         app_path = (app.get("active_deployment") or {}).get("source_code_path", "")
     if app_path:
-        cli("apps", "deploy", APP_NAME, "--source-code-path", app_path, check=False)
+        ok = cli("apps", "deploy", APP_NAME, "--source-code-path", app_path, check=False) == 0 and ok
     else:
         print("  WARNING: could not resolve app source path to restart; the app may need a manual redeploy.")
+        ok = False
+    return ok
 
 
 def main():
@@ -363,7 +422,7 @@ def main():
         sys.exit(1)
 
     print("=" * 60)
-    print("Genie Ontology Readiness — post-deploy")
+    print("Genie Ontology Readiness: post-deploy")
     print("=" * 60)
 
     APP_NAME = resolve_app_name()
@@ -383,7 +442,11 @@ def main():
     env["APP_NAME"] = APP_NAME
     if WAREHOUSE_ID:
         env["WAREHOUSE_ID"] = WAREHOUSE_ID
-    subprocess.run([sys.executable, str(Path(__file__).parent / "setup_app_permissions.py")], env=env)
+    grants_rc = subprocess.run(
+        [sys.executable, str(Path(__file__).parent / "setup_app_permissions.py")], env=env).returncode
+    if grants_rc != 0:
+        print("  WARNING: some grants failed (see above); continuing so the app is still published,"
+              " but affected pillars will show 'not available'.")
 
     print(f"\n[3/3] Publishing the app to target '{TARGET}' (re-sync app.yml + dist, start compute, deploy)...")
     # The app name is fixed by the target in databricks.yml — do NOT pass
@@ -391,19 +454,57 @@ def main():
     # historically, sharing one target's state across app names is the delete
     # footgun this hardening removes). Only warehouse_id is a real per-deploy var.
     var_args = [f"--var=warehouse_id={WAREHOUSE_ID}"] if WAREHOUSE_ID else []
-    cli("bundle", "deploy", "-t", TARGET, *var_args, check=False)
-    rc = cli("bundle", "run", "ontology_readiness", "-t", TARGET, *var_args, check=False)
-    if rc != 0:
-        print(f"  (bundle run failed — ensure --var warehouse_id is set. If the app already "
-              f"exists outside target '{TARGET}' state, redeploy code with `databricks apps deploy {APP_NAME}`.)")
+    deploy_rc = cli("bundle", "deploy", "-t", TARGET, *var_args, check=False)
+    if deploy_rc != 0:
+        print(f"\nFAILED: `bundle deploy` exited {deploy_rc}; nothing was published. "
+              f"Fix the error above and re-run.")
+        sys.exit(deploy_rc)
+    run_rc = cli("bundle", "run", "ontology_readiness", "-t", TARGET, *var_args, check=False)
+
+    # `bundle run` exits non-zero both when the app deployment itself fails and
+    # when the app lives outside this target's Terraform state. Ask the app which
+    # one it was instead of guessing at the warehouse variable.
+    app_state, dep_state, dep_message, url, source_path = deployment_status(APP_NAME)
+    publish_failed = run_rc != 0 or dep_state == "FAILED" or app_state == "UNAVAILABLE"
+    if publish_failed:
+        if dep_state:
+            explain_deploy_failure(APP_NAME, dep_state, dep_message, source_path)
+        else:
+            print(f"\n  `bundle run` exited {run_rc} and `apps get {APP_NAME}` returned nothing. "
+                  f"If the app exists outside target '{TARGET}' state, redeploy its code with "
+                  f"`databricks apps deploy {APP_NAME}`.")
 
     # Attach Lakebase AFTER publishing so `bundle deploy` doesn't strip the resource.
+    # Still done on a failed publish: the resource binding is independent of the
+    # code deployment, and the operator's next `apps deploy` then starts with it.
+    problems = []
     if USE_LAKEBASE and _LAKEBASE["host"]:
-        attach_lakebase()
+        if not attach_lakebase():
+            problems.append("Lakebase attach/redeploy")
+        # attach_lakebase() redeploys, so the live state may have changed either way.
+        # A redeploy of the *old* source path can succeed after `bundle run` failed;
+        # run_rc stays in the condition so that never reads as "new code published".
+        app_state, dep_state, dep_message, url, source_path = deployment_status(APP_NAME)
+        publish_failed = run_rc != 0 or dep_state == "FAILED" or app_state == "UNAVAILABLE"
+    elif not update_app():
+        problems.append("user_api_scopes (OBO)")
+    if grants_rc != 0:
+        problems.append("SP grants")
 
-    print("\nDone. App URL:")
-    cli("apps", "get", APP_NAME, check=False)
-
+    print("\n" + "=" * 60)
+    if publish_failed:
+        print(f"RESULT: FAILED   app={APP_NAME}   app_state={app_state or '?'}   "
+              f"deployment={dep_state or '?'}")
+        print(f"        {dep_message}" if dep_message else "")
+        print(f"URL (will 503 until a deployment succeeds): {url}" if url else "")
+        sys.exit(2)
+    if problems:
+        print(f"RESULT: PUBLISHED WITH ERRORS ({', '.join(problems)})   app={APP_NAME}   "
+              f"deployment={dep_state or '?'}")
+        print(f"URL: {url}" if url else "")
+        sys.exit(3)
+    print(f"RESULT: OK   app={APP_NAME}   app_state={app_state or '?'}   deployment={dep_state or '?'}")
+    print(f"URL: {url}" if url else "")
 
 if __name__ == "__main__":
     main()
