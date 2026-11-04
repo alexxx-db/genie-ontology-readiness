@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Sparkles, Copy, Check, AlertTriangle, FileDown, History, Gauge, Plus, Link2 } from 'lucide-react';
 import { apiGet, apiPost, streamPost } from '../hooks/useApi';
 import type {
@@ -51,6 +51,9 @@ export default function PlanWizard({
   // view pane keeps showing what THIS plan was actually based on even if the live
   // `fromCurrent`/history state changes later in the session.
   const [viewBasis, setViewBasis] = useState<string | null>(null);
+  // In-flight plan stream; aborted by "New plan" and on unmount.
+  const abortRef = useRef<AbortController | null>(null);
+  useEffect(() => () => abortRef.current?.abort(), []);
 
   // Use the in-session scorecard only when there are NO saved snapshots to pick
   // from and history is no longer loading. Empty covers both 'loaded && empty'
@@ -110,6 +113,10 @@ export default function PlanWizard({
   }
 
   function startNewPlan() {
+    // Stop an in-flight generation so it neither keeps streaming nor gets saved.
+    abortRef.current?.abort();
+    abortRef.current = null;
+    setGenerating(false);
     setMode('new');
     setOutput('');
     setError(null);
@@ -136,14 +143,17 @@ export default function PlanWizard({
     // shown and a save error discarded the generated plan.
     setMode('view');
     setGenerating(true);
+    const controller = new AbortController();
+    abortRef.current = controller;
     let acc = '';
     const genBody = genFromCurrent ? { scorecard } : { snapshot_id: genSnapshotId };
     try {
-      for await (const chunk of streamPost('/plan/generate', genBody, model)) {
+      for await (const chunk of streamPost('/plan/generate', genBody, model, controller.signal)) {
+        if (controller.signal.aborted) return;
         acc += chunk;
         setOutput(acc);
       }
-      if (acc.trim()) {
+      if (acc.trim() && !controller.signal.aborted) {
         try {
           const saveBody = genFromCurrent
             ? { snapshot_id: null, title: PLAN_TITLE, markdown: acc }
@@ -156,9 +166,12 @@ export default function PlanWizard({
         }
       }
     } catch (e) {
-      setError((e as Error).message);
+      if (!controller.signal.aborted) setError((e as Error).message);
     } finally {
-      setGenerating(false);
+      if (abortRef.current === controller) {
+        abortRef.current = null;
+        setGenerating(false);
+      }
     }
   }
 

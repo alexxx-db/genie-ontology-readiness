@@ -354,6 +354,11 @@ export interface GenieSpacesResponse {
 }
 
 export interface GenieResult {
+  // Set only by /genie/start-conversation (genie_client.start_conversation).
+  conversation_id?: string;
+  message_id?: string;
+  // Identity that served the Genie call (genie_client._identity_attempts).
+  ran_as?: 'obo' | 'service_principal';
   result: {
     text: string;
     sql: string;
