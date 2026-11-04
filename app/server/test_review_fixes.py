@@ -29,7 +29,7 @@ class PlanSaveOwnershipTest(unittest.IsolatedAsyncioTestCase):
              patch.object(plan_route.snapshots, "get_snapshot", AsyncMock(return_value=None)), \
              patch.object(plan_route.plans, "save_plan", save):
             resp = await plan_route.plan_save(
-                plan_route.PlanSaveRequest(snapshot_id=7, markdown="x"), principal="me@x.com")
+                plan_route.PlanSaveRequest(snapshot_id=7, markdown="x"), principal="me@example.com")
         self.assertEqual(resp.status_code, 404)
         save.assert_not_called()
 
