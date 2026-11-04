@@ -17,6 +17,11 @@ logger = logging.getLogger(__name__)
 _pool = None
 _pool_created_at: float = 0.0
 TOKEN_REFRESH_INTERVAL = 45 * 60  # Refresh pool every 45 minutes (tokens expire at 60 min)
+# A failed init (Lakebase not ready at startup, credential blip) is retried at
+# most this often, so history recovers without a restart but a hard-down
+# Lakebase doesn't make every request pay the 10s connect timeout.
+INIT_RETRY_INTERVAL = 60
+_last_init_attempt: float = 0.0
 
 
 async def _fetch_db_credential(instance_name: str = "", endpoint_name: str = "") -> Optional[str]:
@@ -151,9 +156,8 @@ def _ssl_arg():
     return ctx
 
 
-async def init_pool() -> None:
-    """Create the asyncpg connection pool. Call during app startup."""
-    global _pool, _pool_created_at
+async def _create_pool():
+    """Build a new asyncpg pool (fresh credential). Returns None on any failure."""
     try:
         import asyncpg
 
@@ -183,11 +187,10 @@ async def init_pool() -> None:
                 "Lakebase password not set and no instance credential available — "
                 "assessment history will not persist"
             )
-            _pool = None
-            return
+            return None
 
         logger.info(f"Connecting to Lakebase at {config['host']}:{config['port']}/{config['database']}")
-        _pool = await asyncio.wait_for(
+        pool = await asyncio.wait_for(
             asyncpg.create_pool(
                 host=config["host"],
                 port=config["port"],
@@ -201,29 +204,65 @@ async def init_pool() -> None:
             ),
             timeout=10,  # Don't hang for more than 10s on pool creation
         )
-        _pool_created_at = time.time()
         logger.info("Lakebase connection pool initialized successfully")
+        return pool
     except Exception as e:
         logger.warning(f"Failed to initialize Lakebase pool (will fall back to SQL Warehouse): {e}")
-        _pool = None
+        return None
+
+
+async def init_pool() -> None:
+    """Create the pool and the history tables. Call during app startup.
+
+    History is all-or-nothing: if the tables can't be ensured the pool is closed
+    again, so the feature is cleanly off (and retried later) rather than half-on.
+    """
+    global _pool, _pool_created_at, _last_init_attempt
+    _last_init_attempt = time.time()
+    pool = await _create_pool()
+    if pool is None:
+        return
+    _pool, _pool_created_at = pool, time.time()
+    try:
+        from server import plans, snapshots
+        await snapshots.ensure_table()
+        await plans.ensure_table()
+    except Exception as e:
+        logger.warning(f"Could not ensure Lakebase history tables — history disabled: {e}")
+        _pool, _pool_created_at = None, 0.0
+        try:
+            await pool.close()
+        except Exception:
+            pass
 
 
 async def _refresh_pool_if_needed() -> None:
-    """Recreate pool if OAuth token is near expiry (~45 min)."""
-    global _pool, _pool_created_at
-    if _pool is None or _pool_created_at == 0:
+    """Retry a failed init (rate-limited), or rotate the pool before its token expires.
+
+    Rotation builds the new pool FIRST and only then swaps it in and closes the
+    old one, so concurrent requests never see ``_pool is None`` mid-refresh; if
+    the new pool can't be built the old one is kept (its token may still be valid).
+    """
+    global _pool, _pool_created_at, _last_init_attempt
+    if time.time() - _last_init_attempt < INIT_RETRY_INTERVAL:
+        return
+    if _pool is None:
+        await init_pool()
         return
     elapsed = time.time() - _pool_created_at
     if elapsed < TOKEN_REFRESH_INTERVAL:
         return
+    # Stamp before awaiting so concurrent requests don't each build a pool.
+    _last_init_attempt = time.time()
     logger.info(f"Refreshing Lakebase pool (age: {elapsed/60:.0f} min)")
+    new_pool = await _create_pool()
+    if new_pool is None:
+        return
+    old_pool, _pool, _pool_created_at = _pool, new_pool, time.time()
     try:
-        old_pool = _pool
-        _pool = None
         await old_pool.close()
     except Exception:
         pass
-    await init_pool()
 
 
 async def close_pool() -> None:

@@ -7,6 +7,7 @@ tactical plan to prepare for Genie Ontology, naming the public Databricks
 accelerators that help close each gap. The plan can be exported to a branded PDF.
 """
 
+import asyncio
 import json
 import logging
 import re
@@ -25,7 +26,7 @@ from server.pdf import (
     build_pdf_document,
     markdown_to_safe_html,
     pdf_export_unavailable_response,
-    render_pdf_response,
+    render_pdf_response_async,
 )
 from server import snapshots, plans
 
@@ -43,9 +44,10 @@ class PlanGenerateRequest(BaseModel):
 
 # Field limits are the second half of the body-size cap in app.py: that one bounds
 # the whole request, these bound what actually reaches the PDF renderer and the
-# history table. A generated plan is capped at 2000 output tokens (~10 KB).
+# history table. A generated plan is capped at ~2400 output tokens (~10 KB), so
+# 64 KB leaves generous headroom while bounding render cost.
 _MAX_TITLE = 200
-_MAX_MARKDOWN = 256_000
+_MAX_MARKDOWN = 64_000
 
 
 class PlanSaveRequest(BaseModel):
@@ -210,6 +212,11 @@ async def plan_generate(req: PlanGenerateRequest, principal: str = Depends(curre
 @router.post("/plan/save")
 async def plan_save(req: PlanSaveRequest, principal: str = Depends(current_principal)):
     """Persist a generated plan for the current user, linked to its assessment."""
+    # Same ownership check as /plan/generate: never link a plan to someone else's
+    # snapshot. Skipped when history is off (nothing gets stored anyway).
+    if (req.snapshot_id is not None and await snapshots._enabled()
+            and await snapshots.get_snapshot(req.snapshot_id, created_by=principal) is None):
+        return JSONResponse(status_code=404, content={"error": "Assessment not found."})
     plan_id = await plans.save_plan(
         created_by=principal,
         snapshot_id=req.snapshot_id,
@@ -323,5 +330,5 @@ async def plan_pdf(req: PlanPdfRequest):
     unavailable = pdf_export_unavailable_response()
     if unavailable is not None:
         return unavailable
-    html_doc = _build_plan_pdf_html(req.markdown or "", req.title)
-    return render_pdf_response(html_doc, req.title or "action-plan")
+    html_doc = await asyncio.to_thread(_build_plan_pdf_html, req.markdown or "", req.title)
+    return await render_pdf_response_async(html_doc, req.title or "action-plan")

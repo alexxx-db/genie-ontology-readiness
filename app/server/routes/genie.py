@@ -44,14 +44,14 @@ class GenieMessageRequest(BaseModel):
 
 
 @router.get("/genie/spaces")
-async def list_genie_agents(
-    principal: str = Depends(current_principal),
-    x_forwarded_access_token: Optional[str] = Header(default=None),
-):
-    """List Genie Agents visible to the app (for the pillar 5 detail view)."""
-    set_user_token(x_forwarded_access_token)
+async def list_genie_agents(principal: str = Depends(current_principal)):
+    """List Genie Agents visible to the app (for the pillar 5 detail view).
+
+    Runs as the app SP: the ``sql`` user scope doesn't cover the Genie REST API,
+    so a forwarded viewer token would just be rejected here.
+    """
     host = get_workspace_host()
-    headers = get_auth_headers()
+    headers = get_auth_headers(force_sp=True)
     if not host or not headers:
         return {"spaces": [], "note": "Workspace credentials unavailable."}
     try:
