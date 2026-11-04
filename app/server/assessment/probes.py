@@ -28,12 +28,12 @@ see ``prime_request_sources``.
 
 import asyncio
 import contextvars
-import json
 import logging
+import os
 import aiohttp
 
 from server.security import quote_ident, quote_literal, safe_error
-from server.sql_client import execute_sql, record_query, record_rest_identity, _is_authz_error
+from server.sql_client import execute_sql, record_query, record_rest_identity, _is_authz_error, _DENIAL_MARKERS
 from server.user_agent import with_ua
 from server.config import (
     get_workspace_host,
@@ -90,6 +90,12 @@ def _reason_for(exc: Exception) -> str:
     'insufficient_permission' (the SP or viewer lacks a grant); a missing
     table/schema (system tables not enabled) -> 'not_enabled'; anything else
     (timeout, warehouse down, bad response) -> 'scan_failed'."""
+    # execute_sql treats not-found as authz so OBO retries as the SP; by the time
+    # it reaches here the SP failed too (or ran SP-only), so a not-found on a
+    # system schema with no explicit denial means the schema isn't enabled.
+    msg = str(exc).lower()
+    if _is_not_enabled(exc) and "system" in msg and not any(m in msg for m in _DENIAL_MARKERS):
+        return "not_enabled"
     if _is_authz_error(exc):
         return "insufficient_permission"
     if _is_not_enabled(exc):
@@ -328,6 +334,11 @@ async def _do_resolve_sources() -> dict:
     # BROWSE (not SELECT) — querying their information_schema would fail and
     # break the UNION. Keep only catalogs whose information_schema is
     # actually readable, tested concurrently.
+    # A user-chosen catalog scope must reflect what the VIEWER can read: an OBO
+    # denial must not fall back to the SP (that would leak catalogs they can't
+    # see), and an all-denied selection stays empty rather than reverting to the
+    # full list (which the probes would then read via SP fallback).
+    user_chosen = bool(get_catalog_scope())
     if not use_system and catalogs:
         # Bound concurrency so a wide metastore (many catalogs) can't fan out an
         # unbounded burst of readability probes that trips the warehouse's
@@ -337,13 +348,14 @@ async def _do_resolve_sources() -> dict:
         async def _readable(c: str) -> bool:
             async with _sem:
                 try:
-                    await execute_sql(f"SELECT 1 FROM {quote_ident(c)}.information_schema.tables LIMIT 1")
+                    await execute_sql(f"SELECT 1 FROM {quote_ident(c)}.information_schema.tables LIMIT 1",
+                                      allow_sp_fallback=not user_chosen)
                     return True
                 except Exception:
                     return False
         checks = await asyncio.gather(*(_readable(c) for c in catalogs))
         accessible = [c for c, ok in zip(catalogs, checks) if ok]
-        if accessible:
+        if accessible or user_chosen:
             catalogs = accessible
         logger.info(f"accessible catalogs: {len(catalogs)} of {len(checks)} discovered")
 
@@ -400,7 +412,7 @@ def _src(view: str, sources: dict) -> str | None:
     return f"({union}) AS _t"
 
 
-def _internal_catalog_filter(sources: dict) -> str:
+def _internal_catalog_filter(sources: dict, column: str = "table_catalog") -> str:
     """Extra WHERE clause to exclude internal catalogs when grouping by
     ``table_catalog`` over the metastore-wide system view — the named internal
     catalogs plus any ``__``-prefixed system catalog (e.g. Databricks-internal
@@ -409,7 +421,7 @@ def _internal_catalog_filter(sources: dict) -> str:
     if not sources.get("system_ok"):
         return ""
     in_list = ", ".join("'" + c + "'" for c in _INTERNAL_CATALOGS)
-    return f"AND table_catalog NOT IN ({in_list}) AND table_catalog NOT RLIKE '^__' "
+    return f"AND {column} NOT IN ({in_list}) AND {column} NOT RLIKE '^__' "
 
 
 # ---------------------------------------------------------------------------
@@ -423,11 +435,14 @@ async def probe_uc_foundation() -> dict:
     try:
         tbl = _src("tables", s)
         sch = _src("schemata", s)
-        n_schemas = await _scalar(f"SELECT COUNT(*) FROM {sch} WHERE {_schema_sql(s, 'schema_name')}")
+        n_schemas = await _scalar(
+            f"SELECT COUNT(*) FROM {sch} WHERE {_schema_sql(s, 'schema_name')} "
+            f"{_internal_catalog_filter(s, 'catalog_name')}"
+        )
         rows = await execute_sql(
             f"""SELECT COUNT(*) AS total,
                        SUM(CASE WHEN table_type IN ('MANAGED','MANAGED_SHALLOW_CLONE') THEN 1 ELSE 0 END) AS managed
-                FROM {tbl} WHERE {_schema_sql(s)}"""
+                FROM {tbl} WHERE {_schema_sql(s)} {_internal_catalog_filter(s)}"""
         )
         total = int(rows[0].get("total") or 0)
         managed = int(rows[0].get("managed") or 0)
@@ -747,7 +762,8 @@ async def probe_metadata() -> dict:
         if tt is not None:
             try:
                 tagged_tables = await _scalar(
-                    f"SELECT COUNT(DISTINCT table_name) FROM {tt} WHERE {_schema_sql(s, 'schema_name')}"
+                    f"SELECT COUNT(DISTINCT table_name) FROM {tt} WHERE {_schema_sql(s, 'schema_name')} "
+                    f"{_internal_catalog_filter(s, 'catalog_name')}"
                 )
             except Exception:
                 tagged_tables = None
@@ -823,7 +839,8 @@ async def probe_relationships() -> dict:
         tc = _src("table_constraints", s)
         try:
             rows = await execute_sql(
-                f"SELECT constraint_type, COUNT(*) AS n FROM {tc} WHERE {_schema_sql(s)} GROUP BY constraint_type"
+                f"SELECT constraint_type, COUNT(*) AS n FROM {tc} WHERE {_schema_sql(s)} "
+                f"{_internal_catalog_filter(s)}GROUP BY constraint_type"
             )
             by_type = {r["constraint_type"]: int(r["n"] or 0) for r in rows}
             pk = by_type.get("PRIMARY KEY", 0)
@@ -835,7 +852,8 @@ async def probe_relationships() -> dict:
             f"""SELECT COUNT(*) FROM {tbl}
                 WHERE {_schema_sql(s)}
                   AND (lower(table_schema) RLIKE '(gold|mart|marts|analytics|semantic|presentation|reporting|dwh)'
-                   OR lower(table_name) RLIKE '^(gold_|mart_|dim_|fact_)')"""
+                   OR lower(table_name) RLIKE '^(gold_|mart_|dim_|fact_)')
+                  {_internal_catalog_filter(s)}"""
         ) or 0
 
         score = 0.0
@@ -929,7 +947,7 @@ async def probe_metrics() -> dict:
         for tv in ("METRIC_VIEW", "METRIC VIEW"):
             try:
                 metric_views = await _scalar(
-                    f"SELECT COUNT(*) FROM {tbl} WHERE table_type = '{tv}' {_schema_and(s)}"
+                    f"SELECT COUNT(*) FROM {tbl} WHERE table_type = '{tv}' {_schema_and(s)}{_internal_catalog_filter(s)}"
                 )
                 if metric_views is not None:
                     type_value = tv
@@ -955,7 +973,7 @@ async def probe_metrics() -> dict:
         commented = 0
         try:
             commented = await _scalar(
-                f"SELECT COUNT(*) FROM {tbl} WHERE table_type = '{type_value}' AND comment IS NOT NULL AND trim(comment) <> '' {_schema_and(s)}"
+                f"SELECT COUNT(*) FROM {tbl} WHERE table_type = '{type_value}' AND comment IS NOT NULL AND trim(comment) <> '' {_schema_and(s)}{_internal_catalog_filter(s)}"
             ) or 0
         except Exception:
             commented = 0
@@ -1031,77 +1049,16 @@ async def probe_metrics() -> dict:
 
 
 # ---------------------------------------------------------------------------
-# 5. Genie Agents (REST) — deep curation assessment
+# 5. Genie Agents (audit log) — existence + recent activity
 # ---------------------------------------------------------------------------
-_MAX_INSPECT = 30  # cap how many spaces we deep-inspect to bound latency
-_GENIE_AUDIT_LOOKBACK_DAYS = 30
+# Existence window for counting agents. Must be wider than the 30-day activity
+# window, or total == active_30d always and "exist but inactive" can never fire.
+_GENIE_AUDIT_LOOKBACK_DAYS = 90
 # A space's display_name only appears on create/update audit events, not on the
 # query/conversation events that drive the 30-day activity count. Resolve names
 # over a wider window so an actively-queried but not-recently-edited space still
 # shows a readable name (falling back to its space id when none is in the window).
 _GENIE_NAME_LOOKBACK_DAYS = 90
-
-
-def _count(serialized: dict, *path: str) -> int:
-    """Length of the list at a nested path in a serialized space (0 if missing)."""
-    node = serialized
-    try:
-        for key in path:
-            node = node[key]
-        return len(node) if isinstance(node, list) else 0
-    except (KeyError, TypeError):
-        return 0
-
-
-async def _inspect_space(host: str, headers: dict, sid: str, title: str) -> tuple[str, dict | None]:
-    """Fetch one serialized space and count each curation dimension.
-
-    Returns (status, data):
-      ("ok", {...counts})   — serialized space read and parsed
-      ("forbidden", None)   — the SP lacks CAN_EDIT (serialized read is gated behind edit)
-      ("error", None)       — transient/other failure
-    """
-    try:
-        async with aiohttp.ClientSession(timeout=_PROBE_TIMEOUT, headers=with_ua()) as session:
-            async with session.get(
-                f"{host}/api/2.0/genie/spaces/{sid}",
-                headers=headers, params={"include_serialized_space": "true"},
-            ) as resp:
-                if resp.status in (401, 403):
-                    return "forbidden", None
-                if resp.status != 200:
-                    return "error", None
-                data = await resp.json()
-    except Exception:
-        return "error", None
-
-    ss = data.get("serialized_space")
-    if isinstance(ss, str):
-        try:
-            ss = json.loads(ss)
-        except Exception:
-            ss = None
-    # No serialized payload returned (e.g. insufficient access) — treat as forbidden.
-    if not isinstance(ss, dict):
-        return "forbidden", None
-
-    return "ok", {
-        "title": data.get("title") or title or sid,
-        "instructions": _count(ss, "instructions", "text_instructions"),
-        "sample_questions": _count(ss, "config", "sample_questions"),
-        "example_sqls": _count(ss, "instructions", "example_question_sqls"),
-        "functions": _count(ss, "instructions", "sql_functions"),
-        "benchmarks": _count(ss, "benchmarks", "questions"),
-        "tables": _count(ss, "data_sources", "tables"),
-    }
-
-
-# Reading a space's curation (serialized_space) requires CAN_EDIT; listing/asking
-# only needs CAN_RUN. So the deep per-space breakdown is best-effort: we assess
-# whatever the app can read and never report a space we can't read as "uncurated".
-_EDIT_HINT = ("Reading an agent's curation detail requires CAN_EDIT on that agent; the app only needs "
-              "CAN_RUN to list and count agents. Grant the app service principal CAN_EDIT on the "
-              "agents you want curation-assessed (or run this assessment as a user who can edit them).")
 
 
 async def _genie_audit_counts() -> dict:
@@ -1114,7 +1071,7 @@ async def _genie_audit_counts() -> dict:
     https://docs.databricks.com/aws/en/ai-bi/admin/audit).
 
     Single bounded scan: prune the account-level audit table to the workspaces in
-    scope (the runtime filter) and the last 30 days, then group by space_id and
+    scope (the runtime filter) and the last 90 days, then group by space_id and
     derive per-space "trashed" and "active in last 30 days" flags in one pass. The
     bounds keep this probe below the app gateway's streaming timeout on large accounts.
     Returns total / active_30d (each None if the audit table isn't readable).
@@ -1255,7 +1212,7 @@ async def probe_genie_agents() -> dict:
         "signals": _genie_audit_signals(audit),
         "gaps": gaps,
         "note": f"Counted from the in-scope workspaces' system.access.audit events over the last "
-                f"{_GENIE_AUDIT_LOOKBACK_DAYS} days (aibiGenie). Curation quality — instructions, "
+                f"{_GENIE_AUDIT_LOOKBACK_DAYS} days (aibiGenie); activity uses the last 30. Curation quality — instructions, "
                 "example/verified SQL, benchmarks — isn't visible in the audit log; use the "
                 "Genie Agent Quality Workshop accelerator to assess and lift it.",
         "metrics": {"genie_agents": total, "active_30d": active, "genie_audit": audit},
@@ -1354,13 +1311,15 @@ async def probe_domains() -> dict:
         tbl = _src("tables", s)
         total_tables = governed_tagged = domain_tagged = 0
         try:
-            total_tables = int(await _scalar(f"SELECT COUNT(*) FROM {tbl} WHERE {_schema_sql(s)}") or 0)
+            total_tables = int(await _scalar(
+                f"SELECT COUNT(*) FROM {tbl} WHERE {_schema_sql(s)} {_internal_catalog_filter(s)}"
+            ) or 0)
         except Exception:
             total_tables = 0
         try:
             governed_tagged = int(await _scalar(
                 f"SELECT COUNT(DISTINCT concat_ws('.', catalog_name, schema_name, table_name)) "
-                f"FROM {tt} WHERE {_schema_sql(s, 'schema_name')}"
+                f"FROM {tt} WHERE {_schema_sql(s, 'schema_name')} {_internal_catalog_filter(s, 'catalog_name')}"
             ) or 0)
         except Exception:
             governed_tagged = 0
@@ -1368,6 +1327,7 @@ async def probe_domains() -> dict:
             domain_tagged = int(await _scalar(
                 f"SELECT COUNT(DISTINCT concat_ws('.', catalog_name, schema_name, table_name)) "
                 f"FROM {tt} WHERE lower(tag_name) IN ({domain_keys}) {_schema_and(s, 'schema_name')}"
+                f"{_internal_catalog_filter(s, 'catalog_name')}"
             ) or 0)
         except Exception:
             domain_tagged = 0
@@ -1514,8 +1474,23 @@ async def probe_domains() -> dict:
 # ---------------------------------------------------------------------------
 # 7. Adoption & activity (system tables — optional)
 # ---------------------------------------------------------------------------
+def _exclude_app_sp(column: str) -> tuple[str, dict]:
+    """``AND <column> <> :app_sp`` excluding the app service principal's own reads
+    (assessment SQL, SP-run Genie tests) from activity counts. Databricks Apps
+    inject the SP's application id as DATABRICKS_CLIENT_ID, which is what audit
+    ``user_identity.email`` / query.history ``executed_by`` carry for an SP.
+    ("", {}) when unknown (local dev). Activity run OBO is the viewer's own and
+    can't be told apart, so it still counts."""
+    sp = os.environ.get("DATABRICKS_CLIENT_ID", "").strip()
+    if not sp:
+        return "", {}
+    return f"AND COALESCE({column}, '') <> :app_sp ", {"app_sp": sp}
+
+
 async def probe_adoption() -> dict:
     wsf, wparams = workspace_predicate()
+    sp_audit, sp_params = _exclude_app_sp("user_identity.email")
+    sp_query, _ = _exclude_app_sp("executed_by")
     try:
         # Keep the last read failure so we can classify WHY both signals came back
         # empty (issue #20): system tables not enabled vs. a grant the SP/viewer
@@ -1528,8 +1503,8 @@ async def probe_adoption() -> dict:
             # Scoped to the workspaces in the active filter (issue #25).
             active_users = await _scalar(
                 "SELECT COUNT(DISTINCT user_identity.email) FROM system.access.audit "
-                f"WHERE event_date >= current_date() - INTERVAL 30 DAYS {wsf}",
-                parameters=wparams,
+                f"WHERE event_date >= current_date() - INTERVAL 30 DAYS {wsf}{sp_audit}",
+                parameters={**wparams, **sp_params},
             )
         except Exception as e:
             active_users = None
@@ -1539,8 +1514,8 @@ async def probe_adoption() -> dict:
         try:
             queries_30d = await _scalar(
                 "SELECT COUNT(*) FROM system.query.history "
-                f"WHERE start_time >= current_timestamp() - INTERVAL 30 DAYS {wsf}",
-                parameters=wparams,
+                f"WHERE start_time >= current_timestamp() - INTERVAL 30 DAYS {wsf}{sp_query}",
+                parameters={**wparams, **sp_params},
             )
         except Exception as e:
             queries_30d = None
@@ -1598,7 +1573,7 @@ async def probe_adoption() -> dict:
                 [{"key": "workspace", "label": "Workspace"},
                  {"key": "active_users", "label": "Active users (30d)"},
                  {"key": "queries", "label": "Queries (30d)"}],
-                await _adoption_by_workspace(wsf, wparams),
+                await _adoption_by_workspace(wsf, {**wparams, **sp_params}, sp_audit, sp_query),
             )
 
         return {"available": True, "score": score, "signals": signals, "gaps": [], "note": None,
@@ -1608,7 +1583,7 @@ async def probe_adoption() -> dict:
         return _failed(e, "Adoption signals")
 
 
-async def _adoption_by_workspace(wsf: str, wparams: dict) -> list[dict]:
+async def _adoption_by_workspace(wsf: str, wparams: dict, sp_audit: str = "", sp_query: str = "") -> list[dict]:
     """Best-effort per-workspace active-users and query volume for the adoption
     drill-down, with workspace names from system.access.workspaces_latest."""
     try:
@@ -1618,12 +1593,12 @@ async def _adoption_by_workspace(wsf: str, wparams: dict) -> list[dict]:
             "FROM ( "
             "  SELECT workspace_id, COUNT(DISTINCT user_identity.email) AS active_users "
             "  FROM system.access.audit "
-            f"  WHERE event_date >= current_date() - INTERVAL 30 DAYS {wsf}"
+            f"  WHERE event_date >= current_date() - INTERVAL 30 DAYS {wsf}{sp_audit}"
             "  GROUP BY workspace_id "
             ") u "
             "LEFT JOIN ( "
             "  SELECT workspace_id, COUNT(*) AS queries FROM system.query.history "
-            f"  WHERE start_time >= current_timestamp() - INTERVAL 30 DAYS {wsf}"
+            f"  WHERE start_time >= current_timestamp() - INTERVAL 30 DAYS {wsf}{sp_query}"
             "  GROUP BY workspace_id "
             ") q ON CAST(u.workspace_id AS STRING) = CAST(q.workspace_id AS STRING) "
             "LEFT JOIN system.access.workspaces_latest w "

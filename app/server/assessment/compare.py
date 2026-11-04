@@ -161,7 +161,11 @@ def _ordered_keys(base_pillars: dict, cur_pillars: dict) -> list[str]:
 
 
 def _overall_diff(base_over: dict, cur_over: dict) -> dict:
-    """Overall-score delta plus any level/stage crossing."""
+    """Overall-score delta plus any level/stage crossing.
+
+    The overall is computed over available pillars only, so when the two runs
+    covered different weight (a pillar became (un)readable) the delta mixes a
+    real change with a coverage change — ``coverage_changed`` flags that."""
     b_score = base_over.get("score")
     c_score = cur_over.get("score")
     delta = None
@@ -193,6 +197,10 @@ def _overall_diff(base_over: dict, cur_over: dict) -> dict:
         "current_level_label": cur_over.get("level_label") or "",
         "level_change": level_change,
         "stage_change": stage_change,
+        "coverage_changed": bool(
+            base_over.get("coverage") and cur_over.get("coverage")
+            and base_over["coverage"].get("available_weight") != cur_over["coverage"].get("available_weight")
+        ),
     }
 
 
@@ -219,7 +227,18 @@ def compare_snapshots(baseline: dict, current: dict) -> dict:
         for status in ("improved", "regressed", "unchanged", "new", "removed", "unavailable")
     }
 
+    # Runs over different catalogs/schemas/workspaces or identities measure
+    # different populations; flag it rather than present the diff as like-for-like.
+    # Older snapshots carry no scope — unknown, so not flagged.
+    base_scope, cur_scope = base_sc.get("scope"), cur_sc.get("scope")
+    mismatch_fields = sorted(
+        k for k in set(base_scope or {}) | set(cur_scope or {})
+        if base_scope and cur_scope and base_scope.get(k) != cur_scope.get(k)
+    )
+
     return {
+        "scope_mismatch": bool(mismatch_fields),
+        "scope_mismatch_fields": mismatch_fields,
         "baseline": {
             "id": baseline.get("id"),
             "created_at": baseline.get("created_at"),
