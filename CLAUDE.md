@@ -225,6 +225,9 @@ Backend tests sit next to code (`app/server/test_*.py`, `app/server/assessment/t
 
 ## Local development
 
+One-shot toolchain (Python 3.11, Node 22, app deps, pytest/ruff/pre-commit): `conda env create -f environment.yml`.
+The Databricks CLI is not on conda; install it with `brew install databricks/tap/databricks`.
+
 ```bash
 # Backend (uses your CLI profile)
 cd app
