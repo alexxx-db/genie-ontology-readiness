@@ -95,8 +95,8 @@ The notebook creates or reuses the app, applies the same service-principal grant
 `setup_app_permissions.py`, renders `app.yml`, and deploys. The frontend is built by the
 Databricks Apps runtime during deployment, so nothing is built on your machine. The
 staged source lives in `/Workspace/Users/<you>/.genie-ontology-readiness/<app_name>`.
-The app name is a widget (default `genie-ontology-readiness`), so use a different name
-than any app you manage with `bundle deploy` to keep the two flows separate.
+The app name is a widget (default `genie-ontology-readiness-nb`, distinct from every
+bundle target's name), so keep it different from any app you manage with `bundle deploy`.
 
 ### Run the assessment without the app (Genie Code skill)
 
