@@ -1,6 +1,7 @@
 """Assessment endpoints — run the readiness scorecard, manage per-user history,
 and export a scorecard as a branded PDF."""
 
+import asyncio
 import json
 import logging
 from datetime import datetime, timezone
@@ -13,12 +14,12 @@ from pydantic import BaseModel, Field
 from server.assessment.compare import compare_snapshots
 from server.assessment.scoring import run_assessment, run_assessment_stream
 from server.routes._shared import _cache_get, _cache_set, current_principal
-from server.config import set_user_token
+from server.config import set_user_token, get_user_token
 from server.pdf import (
     build_pdf_document,
     markdown_to_safe_html,
     pdf_export_unavailable_response,
-    render_pdf_response,
+    render_pdf_response_async,
 )
 from server.workspace_filter import set_workspace_filter, set_catalog_scope, set_schema_scope
 from server.security import safe_error
@@ -89,6 +90,18 @@ async def assess_get(
     return result
 
 
+def _run_scope(wsf: Optional[dict], cat_scope, sch_scope) -> dict:
+    """Normalized scope of one run (order-insensitive). Call after set_user_token:
+    get_user_token() is None under FORCE_SP or with no forwarded token → SP."""
+    ids = sorted((wsf or {}).get("workspace_ids") or [])
+    return {
+        "catalogs": sorted(cat_scope or []),
+        "schemas": sorted(sch_scope or []),
+        "workspace_filter": {"mode": wsf.get("mode", "include"), "workspace_ids": ids} if ids else None,
+        "identity_mode": "obo" if get_user_token() else "sp",
+    }
+
+
 @router.post("/assess/stream")
 async def assess_stream(
     req: AssessRequest = Body(default=AssessRequest()),
@@ -121,6 +134,9 @@ async def assess_stream(
                         "overall": event["overall"],
                         "pillars": event["pillars"],
                         "top_gaps": event["top_gaps"],
+                        # What this run covered, so compare can refuse to silently
+                        # diff two runs over different populations / identities.
+                        "scope": _run_scope(wsf, cat_scope, sch_scope),
                     }
                     try:
                         sid = await snapshots.save_snapshot(scorecard, created_by=principal)
@@ -349,8 +365,9 @@ async def assess_pdf(req: AssessPdfRequest, principal: str = Depends(current_pri
             content={"error": "The assessment is empty — run an assessment first."},
         )
 
-    html_doc = _build_assessment_pdf_html(scorecard, req.title)
-    return render_pdf_response(html_doc, _assessment_filename(req.title))
+    # Markdown + PDF rendering is CPU-bound; keep it off the event loop.
+    html_doc = await asyncio.to_thread(_build_assessment_pdf_html, scorecard, req.title)
+    return await render_pdf_response_async(html_doc, _assessment_filename(req.title))
 @router.get("/assess/compare")
 async def assess_compare(
     baseline: int,

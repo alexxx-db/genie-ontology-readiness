@@ -39,7 +39,7 @@ step "Backend: install deps (app requirements + tooling)"
 # provision them before collecting — mirror the frontend's `npm ci`. Best-effort
 # so a machine without a writable pip env degrades to the skips below rather than
 # aborting; use a venv/uv if this warns (e.g. PEP 668 externally-managed).
-python3 -m pip install -q -r app/requirements.txt ruff pytest || \
+python3 -m pip install -q -r app/requirements.txt ruff pytest pypdf httpx2 || \
   echo "  (warning) backend dep install failed — ruff/pytest may be skipped below" >&2
 
 step "Backend: ruff lint"

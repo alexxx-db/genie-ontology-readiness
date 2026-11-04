@@ -13,9 +13,11 @@ The bodies these functions render are ALWAYS pre-sanitized by the caller with
 ``src``/``href`` the sanitizer might have missed.
 """
 
+import asyncio
 import html as _html
 import io
 import logging
+from urllib.parse import quote
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -162,9 +164,19 @@ def render_pdf_response(html_doc: str, filename_base: str) -> Response:
     if result.err:
         logger.error("PDF generation failed")
         return Response(content="PDF generation failed", status_code=500)
-    safe = "".join(c if c.isalnum() or c in "-_ " else "_" for c in filename_base).strip() or "document"
+    # Header values must be latin-1: an ASCII-only `filename` for old clients, plus
+    # the real (possibly non-Latin) name as RFC 5987 `filename*`.
+    base = (filename_base or "").strip() or "document"
+    ascii_name = "".join(c if c.isascii() and (c.isalnum() or c in "-_ ") else "_" for c in base).strip() or "document"
     return Response(
         content=buf.getvalue(),
         media_type="application/pdf",
-        headers={"Content-Disposition": f'inline; filename="{safe}.pdf"'},
+        headers={"Content-Disposition": (
+            f'inline; filename="{ascii_name}.pdf"; filename*=UTF-8\'\'{quote(base + ".pdf", safe="")}'
+        )},
     )
+
+
+async def render_pdf_response_async(html_doc: str, filename_base: str) -> Response:
+    """``render_pdf_response`` off the event loop — pisa is CPU-bound and blocking."""
+    return await asyncio.to_thread(render_pdf_response, html_doc, filename_base)

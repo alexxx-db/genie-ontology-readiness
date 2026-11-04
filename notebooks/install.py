@@ -36,7 +36,7 @@ dbutils.library.restartPython()
 
 # COMMAND ----------
 
-dbutils.widgets.text("app_name", "genie-ontology-readiness", "App name")
+dbutils.widgets.text("app_name", "genie-ontology-readiness-nb", "App name")
 dbutils.widgets.text("warehouse_id", "", "SQL warehouse ID (empty = first available)")
 dbutils.widgets.text("assess_catalogs", "", "Catalogs to assess (comma-separated, empty = all)")
 dbutils.widgets.text("genie_space_id", "", "Genie Agent ID for the answer test (optional)")
@@ -235,7 +235,8 @@ if not catalogs:
     ]
     print(f"  discovered {len(catalogs)} non-system catalogs")
 grant_results += grant_all([
-    f"GRANT USE CATALOG, USE SCHEMA, SELECT ON CATALOG {_ident(cat)} TO {sp}" for cat in catalogs
+    # Metadata only (information_schema + tags): BROWSE, not SELECT on the data.
+    f"GRANT USE CATALOG, BROWSE ON CATALOG {_ident(cat)} TO {sp}" for cat in catalogs
 ])
 
 failed_grants = grant_results.count(False)

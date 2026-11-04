@@ -60,3 +60,18 @@ def test_resolve_ignores_explicit_app_name_env(monkeypatch):
                         lambda *a: _bundle_summary("genie-ontology-readiness-dev"))
     monkeypatch.setenv("APP_NAME", "genie-ontology-readiness")  # stale prod name
     assert post_deploy.resolve_app_name() == "genie-ontology-readiness-dev"
+
+
+def test_deployment_status_prefers_pending(monkeypatch):
+    """After a failed redeploy, active_deployment is still the old good one; the
+    failed pending one must win or the run reports the stale success."""
+    app = {
+        "app_status": {"state": "RUNNING"},
+        "active_deployment": {"status": {"state": "SUCCEEDED"}, "source_code_path": "/old"},
+        "pending_deployment": {"status": {"state": "FAILED", "message": "Error installing packages"},
+                               "source_code_path": "/new"},
+        "url": "https://x",
+    }
+    monkeypatch.setattr(post_deploy, "cli_json", lambda *a: app)
+    assert post_deploy.deployment_status("a") == (
+        "RUNNING", "FAILED", "Error installing packages", "https://x", "/new")

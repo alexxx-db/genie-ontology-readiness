@@ -204,7 +204,7 @@ class PrincipalResolutionTest(unittest.IsolatedAsyncioTestCase):
                 forwarded_email="attacker@example.org", forwarded_token="tok")
         self.assertEqual(principal, "victim@example.com")
 
-    async def test_falls_back_to_the_header_when_the_token_cannot_be_resolved(self):
+    async def test_falls_back_to_the_header_on_a_transient_lookup_failure(self):
         async def fake(token):
             return None
 
@@ -212,6 +212,18 @@ class PrincipalResolutionTest(unittest.IsolatedAsyncioTestCase):
             principal = await security.resolve_principal(
                 forwarded_email="Jane.Doe@Example.com", forwarded_token="tok")
         self.assertEqual(principal, "jane.doe@example.com")
+
+    async def test_rejected_token_fails_closed_instead_of_trusting_the_header(self):
+        from fastapi import HTTPException
+
+        async def fake(token):
+            return security._TOKEN_REJECTED
+
+        with patch.object(security, "_identity_from_token", fake):
+            with self.assertRaises(HTTPException) as ctx:
+                await security.resolve_principal(
+                    forwarded_email="victim@example.com", forwarded_token="junk")
+        self.assertEqual(ctx.exception.status_code, 401)
 
     async def test_normalises_the_header_identity(self):
         self.assertEqual(

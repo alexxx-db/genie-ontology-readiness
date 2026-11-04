@@ -63,7 +63,10 @@ async def list_schemas(
     try:
         rows = await execute_sql(
             f"SELECT schema_name AS name FROM {quote_ident(name)}.information_schema.schemata "
-            "WHERE schema_name <> 'information_schema' ORDER BY schema_name"
+            "WHERE schema_name <> 'information_schema' ORDER BY schema_name",
+            # The user picked this catalog: list only what THEY can see, never
+            # the app SP's view of it.
+            allow_sp_fallback=False,
         )
         schemas = [{"name": r.get("name")} for r in rows if r.get("name")]
         return {"schemas": schemas, "available": True}

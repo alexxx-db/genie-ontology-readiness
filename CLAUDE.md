@@ -20,14 +20,16 @@ Bundles** + `post_deploy.py`.
 - **Databricks workspace** with Unity Catalog (a serverless workspace is recommended).
 - **Databricks CLI 0.287+** — `databricks --version`.
 - **Authenticated profile**: `databricks auth login --host <workspace-url> --profile <name>`.
-- **Node.js 18+** and **Python 3.11** with `pip install "databricks-sdk>=0.36.0"`.
+- **Node.js 20.19+ or 22.12+** (per `app/frontend/package.json` engines) and **Python 3.11** with `pip install "databricks-sdk>=0.36.0"`.
 - A **SQL Warehouse** (its `id` is needed for assessment queries).
 
 ## Deployment (3 commands)
 
 No local tooling? Run [`notebooks/install.py`](notebooks/install.py) from a workspace
 Git folder on serverless instead: it does the same create/grant/render/deploy steps
-with the SDK, and the Databricks Apps runtime builds the frontend. See the README.
+with the SDK, and the Databricks Apps runtime builds the frontend. Its default app
+name is `genie-ontology-readiness-nb`, so it never collides with a bundle target.
+See the README.
 
 All commands run from the repository root.
 
@@ -82,7 +84,10 @@ connection env. Assessment history and generated plans are then persisted
 **per user** (keyed by the `X-Forwarded-Email` identity Databricks Apps inject)
 and survive across sessions. Scores are a deterministic function of the technical
 findings, so repeated runs on the same workspace are directly comparable **for a
-given identity**. Under OBO the findings reflect the viewing user's grants, so
+given identity and scope**. The overall score averages only the pillars that could
+be read (weights renormalized; `overall.coverage` reports how much was), and each
+saved run records its `scope` so Compare flags `scope_mismatch` instead of
+reporting a scope change as movement. Adoption excludes the app SP's own activity. Under OBO the findings reflect the viewing user's grants, so
 signals gated behind grants a viewer lacks (notably the workspace-wide Adoption
 system tables) can read lower for a restricted viewer than for the SP — use
 `FORCE_SP=true` when you need a single, viewer-independent workspace-wide score.
@@ -106,7 +111,10 @@ policy lives in `sql_client.execute_sql`:
    Lakebase credential minting.
 2. Otherwise, when a forwarded token is present, the read runs **OBO**; if it
    fails (e.g. the viewer lacks a system-table grant the SP holds) it
-   **transparently falls back to the SP** rather than dropping the signal.
+   **transparently falls back to the SP** rather than dropping the signal —
+   except reads of a scope the **user explicitly picked** (catalog/schema
+   selection), which use `allow_sp_fallback=False` so the SP can't leak metadata
+   the viewer has no grant on.
 3. With no forwarded token (OBO disabled, scheduled/unattended, local dev), the
    read runs as the **SP** directly.
 
@@ -131,25 +139,22 @@ least-privilege grant for metadata-only visibility (viewer or SP).
 `scripts/setup_app_permissions.py` (called by `post_deploy.py`) grants the SP:
 
 - `USE CATALOG`/`USE SCHEMA`/`SELECT` on `system.information_schema`, `system.access`, `system.query`
-- `USE CATALOG`/`USE SCHEMA`/`SELECT` on each assessed catalog
+- `USE CATALOG` + `BROWSE` on each assessed catalog (metadata only — no data access)
+
+It exits non-zero if any grant fails, and `post_deploy.py` then ends with
+`RESULT: PUBLISHED WITH ERRORS` (exit 3); a failed deployment exits 2.
 
 For an **org-wide** assessment, an account admin can instead grant at the metastore
 level. If the SP can't read `system.information_schema`, the app automatically
 falls back to reading each accessible catalog's own `information_schema` (only
-catalog-level SELECT is needed). Pillars whose data the SP can't read degrade
+`USE CATALOG` + `BROWSE` is needed). Pillars whose data the SP can't read degrade
 gracefully to "not available" plus a self-assessment fallback — they never crash
 the app.
 
-**Genie Agents (pillar 5):** Genie Agents have their own ACLs. The app needs
-`CAN_RUN` on an agent to **list and count** it. Reading an agent's **curation
-detail** (instructions, sample questions, example/verified SQL, functions,
-benchmarks) comes from the agent's serialized definition, which Databricks gates
-behind **`CAN_EDIT`** — so the per-agent curation breakdown is best-effort: the
-app assesses whatever agents it can read and reports the rest as "curation not
-assessed (needs CAN_EDIT)" rather than as uncurated. Granting an app SP
-`CAN_EDIT` across every agent is a heavy ask; for a lighter footprint, grant
-`CAN_RUN` (counts only) and rely on the self-assessment for curation depth, or
-have an editor run the deep pass.
+**Genie Agents (pillar 5):** scored from `system.access.audit` only: agents
+seen in the last 90 days, and how many were active in the last 30. Per-agent
+curation (instructions, example SQL, benchmarks) is **not** scored; that needs
+`CAN_EDIT` on each agent and is left to the self-assessment.
 
 ## Architecture
 
@@ -170,9 +175,14 @@ app/
     content/library.py       — embedded technical+business enablement content
     content/accelerators.py  — runnable accelerators that lift a pillar's score
     content/methodology.py   — build methodology (5 phases); grounds the Plan LLM
+    security.py              — log redaction, error sanitization, identifier quoting, per-user principal
+    workspace_filter.py      — request-scoped workspace_id predicate for system-table signals
+    bindings.py              — catalog↔workspace binding resolution (UC REST)
+    assessment/compare.py    — diff two saved assessments
     routes/
-      config.py  assess.py  content.py  plan.py  chat.py  genie.py  _shared.py
-  frontend/                  — React + Vite + Tailwind (4 tabs: Assess/Learn/Plan/Assistant)
+      config.py  assess.py  catalogs.py  workspaces.py  content.py  plan.py  genie.py  _shared.py
+  accelerators/              — downloadable Databricks notebooks (excluded from ruff; dbutils/spark globals)
+  frontend/                  — React 19 + Vite + Tailwind v4 (3 tabs: Assess/Plan/Learn)
 notebooks/
   install.py                 — workspace notebook installer (no CLI / Node.js needed)
 scripts/
@@ -191,7 +201,32 @@ Genie forming, Curated and validating, Ontology-ready), and the next-step
 guidance is derived from the customer's actual pillar gaps rather than a fixed
 per-tier agenda.
 
+## Quality gate (there is no CI)
+
+GitHub Actions is disabled at the org level — `scripts/check.sh` **is** the CI. Run it before pushing:
+
+```bash
+bash scripts/check.sh                          # frontend build+tsc, vitest, build assertion, ruff, pytest, compliance scan
+GOR_VERIFY_DOC_LINKS=1 bash scripts/check.sh   # + network doc-link check (release only)
+```
+
+Individual pieces:
+
+```bash
+pytest -q                                              # collects tests/ and app/server/ (pythonpath=app)
+pytest tests/test_pillars.py::test_name -q             # single test
+ruff check app scripts                                 # lint: only E9 + F (pyflakes/syntax), line-length 120
+cd app/frontend && npm test                            # vitest; tests live in app/frontend/__tests__/
+bash scripts/__tests__/compliance_scan.test.sh         # secrets / raw-data scan — must pass
+```
+
+Backend tests sit next to code (`app/server/test_*.py`, `app/server/assessment/test_*.py`) as well as in
+`tests/` (import-light suites). They import runtime deps, so `pip install -r app/requirements.txt pytest`.
+
 ## Local development
+
+One-shot toolchain (Python 3.11, Node 22, app deps, pytest/ruff/pre-commit): `conda env create -f environment.yml`.
+The Databricks CLI is not on conda; install it with `brew install databricks/tap/databricks`.
 
 ```bash
 # Backend (uses your CLI profile)

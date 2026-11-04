@@ -79,8 +79,12 @@ def _assemble_pillar(pillar_def: dict, probe: dict) -> dict:
 
 def _finalize(pillars_out: list[dict]) -> dict:
     """Compute the overall score + prioritized gaps from all pillar entries."""
-    weighted_sum = sum(p["score"] * p["weight"] for p in pillars_out)
-    weight_total = sum(p["weight"] for p in pillars_out)
+    # Overall is over AVAILABLE pillars only (weights renormalized): an unreadable
+    # pillar is "not measured", not a real 0, so it must not drag the score down.
+    # `coverage` says how much of the model the score actually covers.
+    available = [p for p in pillars_out if p["available"]]
+    weighted_sum = sum(p["score"] * p["weight"] for p in available)
+    weight_total = sum(p["weight"] for p in available)
     overall_score = round(weighted_sum / weight_total, 1) if weight_total else 0.0
     overall_level = level_from_score(overall_score)
     stage = readiness_stage(overall_score)
@@ -103,6 +107,12 @@ def _finalize(pillars_out: list[dict]) -> dict:
             # static per-tier agenda; generic tier detail is the no-gaps fallback.
             "readiness_detail": readiness_guidance(ranked, stage["detail"]),
             "assessed_at": datetime.now(timezone.utc).isoformat(),
+            "coverage": {
+                "available_weight": weight_total,
+                "total_weight": sum(p["weight"] for p in pillars_out),
+                "available_pillars": len(available),
+                "total_pillars": len(pillars_out),
+            },
         },
         "top_gaps": top_gaps,
     }

@@ -18,8 +18,9 @@ async def _enabled() -> bool:
     if not USE_LAKEBASE:
         return False
     try:
-        from server.lakebase_client import is_available
-        return is_available()
+        # get_pool (not is_available) so a failed startup init gets retried.
+        from server.lakebase_client import get_pool
+        return await get_pool() is not None
     except Exception:
         return False
 

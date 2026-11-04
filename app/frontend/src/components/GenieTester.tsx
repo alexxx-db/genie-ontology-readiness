@@ -12,6 +12,7 @@ export default function GenieTester() {
   const [question, setQuestion] = useState('');
   const [conversationId, setConversationId] = useState<string | null>(null);
   const [result, setResult] = useState<GenieResult['result'] | null>(null);
+  const [ranAs, setRanAs] = useState<GenieResult['ran_as']>();
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -40,10 +41,10 @@ export default function GenieTester() {
         res = await apiPost<GenieResult>('/genie/start-conversation', {
           content: question,
         });
-        const cid = (res as unknown as { conversation_id?: string }).conversation_id;
-        if (cid) setConversationId(cid);
+        if (res.conversation_id) setConversationId(res.conversation_id);
       }
       setResult(res.result);
+      setRanAs(res.ran_as);
     } catch (e) {
       setError((e as Error).message);
     } finally {
@@ -85,6 +86,11 @@ export default function GenieTester() {
       {result && (
         <div className="mt-3 space-y-2">
           {result.text && <p className="text-sm text-ink-700">{result.text}</p>}
+          {ranAs && (
+            <p className="text-[11px] text-ink-400">
+              Answered as: {ranAs === 'obo' ? 'you' : 'app service principal'}
+            </p>
+          )}
           {result.sql && (
             <pre className="bg-ink-900 text-gray-100 rounded-md p-2 overflow-x-auto text-[11px]">
               <code>{result.sql}</code>

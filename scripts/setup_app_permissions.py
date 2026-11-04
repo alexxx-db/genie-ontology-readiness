@@ -3,7 +3,8 @@
 The app reads:
   - system.information_schema (catalogs/schemas/tables/columns/constraints/tags)
   - system.access / system.query (adoption signals — optional)
-  - each catalog being assessed (so those objects appear in information_schema)
+  - each catalog being assessed: USE CATALOG + BROWSE (metadata only, so those
+    objects appear in information_schema; no SELECT on table data)
 
 Because Databricks Apps run as a service principal (no end-user token
 forwarding), the SP needs these grants or the assessment degrades to
@@ -109,6 +110,8 @@ def main():
         product_version=resolve_version(),
     )
 
+    failed: list[str] = []
+
     def grant(stmt: str):
         label = stmt.split(" ON ")[0].replace("GRANT ", "")
         target = stmt.split(" ON ", 1)[1].split(" TO ")[0] if " ON " in stmt else ""
@@ -120,8 +123,10 @@ def main():
             else:
                 err = res.status.error.message[:120] if res.status.error else "unknown"
                 print(f"  FAIL {label} ON {target} — {err}")
+                failed.append(stmt)
         except Exception as e:
             print(f"  ERR  {label} ON {target} — {str(e)[:120]}")
+            failed.append(stmt)
 
     # 1) System schemas (information_schema is the core; access/query are optional)
     print("\n[1/2] Granting read on system schemas...")
@@ -146,12 +151,19 @@ def main():
         # Back-quote the catalog identifier so names with hyphens or other
         # special characters (e.g. "cardiac-intelligence-lakebase") are valid.
         cat_id = _ident(cat)
+        # Metadata only: the app reads <catalog>.information_schema and tags,
+        # never table data. BROWSE makes every object visible there without
+        # SELECT on the data; USE CATALOG lets it query <catalog>.information_schema.
         grant(f"GRANT USE CATALOG ON CATALOG {cat_id} TO {sp_id}")
-        grant(f"GRANT USE SCHEMA ON CATALOG {cat_id} TO {sp_id}")
-        grant(f"GRANT SELECT ON CATALOG {cat_id} TO {sp_id}")
+        grant(f"GRANT BROWSE ON CATALOG {cat_id} TO {sp_id}")
 
+    if failed:
+        print(f"\nPermissions setup FAILED: {len(failed)} grant(s) did not apply:")
+        for stmt in failed:
+            print(f"  - {stmt}")
+        sys.exit(1)
     print("\nPermissions setup complete.")
-    print("Note: SELECT on catalogs lets the SP see those objects in information_schema.")
+    print("Note: BROWSE on catalogs lets the SP see those objects' metadata (no data access).")
     print("For org-wide assessment, an account admin can instead grant at the metastore level.")
 
 

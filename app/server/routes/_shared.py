@@ -27,8 +27,8 @@ async def current_principal(
     Every per-user route depends on this instead of reading the forwarded email
     header directly, so ownership is bound to an identity the app established —
     from the forwarded token where one exists — rather than to a header value a
-    caller could set (CWE-290). This always resolves to a usable key, so no
-    request is ever refused for lack of an identity.
+    caller could set (CWE-290). This resolves to a usable key whenever no identity
+    is available; only a forwarded token the workspace rejects is refused (401).
     """
     return await resolve_principal(forwarded_email=x_forwarded_email,
                                    forwarded_token=x_forwarded_access_token)
@@ -49,11 +49,16 @@ def _cache_get(key: str):
     return None
 
 
-def _cache_set(key: str, value: object):
+def _cache_set(key: str, value: object, ttl: float = CACHE_TTL):
     if len(_response_cache) >= MAX_CACHE_SIZE:
         oldest_key = min(_response_cache, key=lambda k: _response_cache[k][0])
         del _response_cache[oldest_key]
-    _response_cache[key] = (time.time(), value)
+    # A shorter ttl is stored as a back-dated entry so _cache_get stays unchanged.
+    _response_cache[key] = (time.time() - (CACHE_TTL - ttl), value)
+
+
+# A failed serving-endpoints lookup is retried after this long, not CACHE_TTL.
+_FAILURE_TTL = 60
 
 
 def _cache_clear():
@@ -343,8 +348,9 @@ async def list_available_models() -> list[dict]:
     returns a list of {id, label, provider, family, open_source} dicts (see
     _model_record) so the picker can group by licensing and family.
 
-    Results are cached for CACHE_TTL (10 min). On ANY error, falls back to
-    static AI_MODELS entries so the dropdown is never empty.
+    Results are cached for CACHE_TTL (10 min); a failed lookup only for
+    _FAILURE_TTL. On ANY error, falls back to static AI_MODELS entries so the
+    dropdown is never empty.
     """
     from server.config import get_workspace_host, get_auth_headers
 
@@ -360,7 +366,7 @@ async def list_available_models() -> list[dict]:
         if not host or not auth_headers:
             logger.warning("Missing host or auth headers; falling back to static AI_MODELS")
             result = [_model_record(k) for k in AI_MODELS]
-            _cache_set("serving_models", result)
+            _cache_set("serving_models", result, _FAILURE_TTL)
             return result
 
         url = f"{host}/api/2.0/serving-endpoints"
@@ -372,7 +378,7 @@ async def list_available_models() -> list[dict]:
                 error_text = await response.text()
                 logger.warning(f"serving-endpoints API error ({response.status}): {error_text[:200]}")
                 result = [_model_record(k) for k in AI_MODELS]
-                _cache_set("serving_models", result)
+                _cache_set("serving_models", result, _FAILURE_TTL)
                 return result
 
             data = await response.json()
@@ -389,7 +395,7 @@ async def list_available_models() -> list[dict]:
             if not models:
                 logger.warning("No chat endpoints found in serving-endpoints API")
                 result = [_model_record(k) for k in AI_MODELS]
-                _cache_set("serving_models", result)
+                _cache_set("serving_models", result, _FAILURE_TTL)
                 return result
 
             # Sort: known/curated families first (Anthropic, OpenAI, Google), then alpha
@@ -402,7 +408,7 @@ async def list_available_models() -> list[dict]:
     except Exception as e:
         logger.error(f"Error fetching serving endpoints: {e}")
         result = [_model_record(k) for k in AI_MODELS]
-        _cache_set("serving_models", result)
+        _cache_set("serving_models", result, _FAILURE_TTL)
         return result
 
 

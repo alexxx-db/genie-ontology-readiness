@@ -1,0 +1,26 @@
+# Full local dev environment: backend runtime, tests, lint, deploy scripts, frontend build.
+#   conda env create -f environment.yml
+#   conda activate genie-ontology-readiness
+#   cd app/frontend && npm ci          # JS deps stay in package-lock.json
+#
+# Not on conda: the Databricks CLI (Go binary, 0.287+). conda-forge's
+# `databricks-cli` is the old Python CLI and will not work with bundles.
+#   brew tap databricks/tap && brew install databricks
+name: genie-ontology-readiness
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11            # matches the Databricks Apps runtime
+  - nodejs=22              # frontend engines: ^20.19.0 || >=22.12.0
+  - pip
+  - pip:
+      # App runtime pins: single source of truth, resolved relative to this file.
+      - -r app/requirements.txt
+      # Imported directly by scripts/tests
+      - certifi
+      # Tests and lint (scripts/check.sh, .pre-commit-config.yaml)
+      - pytest
+      - pypdf              # PDF assertions in app/server/test_*pdf*.py
+      - httpx2             # required by starlette.testclient (Starlette 1.x)
+      - ruff
+      - pre-commit

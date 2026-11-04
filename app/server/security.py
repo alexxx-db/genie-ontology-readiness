@@ -303,6 +303,9 @@ _IDENTITY_NEGATIVE_TTL = 60
 _IDENTITY_LOOKUP_TIMEOUT = 5
 _identity_cache: dict[str, tuple[float, Optional[str]]] = {}
 _IDENTITY_CACHE_MAX = 500
+# Lookup outcome meaning "the workspace rejected this token" (401/403), as opposed
+# to None = "couldn't ask" (network error, 5xx). Falsy, so it's cached briefly.
+_TOKEN_REJECTED = ""
 
 # Ownership key used when the app runs outside Databricks Apps (local development
 # against a CLI profile).
@@ -351,6 +354,13 @@ async def _identity_from_token(token: str) -> Optional[str]:
                 f"{host}/api/2.0/preview/scim/v2/Me",
                 headers={"Authorization": f"Bearer {token}"},
             ) as response:
+                # Only 401 (token invalid/forged) fails closed. 403 means a genuine token
+                # lacking a scope for this lookup; treating that as fatal would lock out
+                # every user on such workspaces, so it falls back like a transient error.
+                if response.status == 401:
+                    logger.warning("identity lookup rejected the forwarded token (%s)", response.status)
+                    _remember_identity(fingerprint, _TOKEN_REJECTED)
+                    return _TOKEN_REJECTED
                 if response.status != 200:
                     logger.warning("identity lookup returned %s; falling back to the forwarded header",
                                    response.status)
@@ -380,15 +390,24 @@ async def resolve_principal(
 ) -> Optional[str]:
     """The ownership key for this request's per-user records.
 
-    Always returns a usable key — a request is never refused for lack of an
-    identity, because that would make a user's own history unreachable over an
-    infrastructure hiccup. Preference order: the identity the workspace confirms
-    for a forwarded token, then the forwarded header, then a named fallback.
+    Returns a usable key whenever no identity is available — a request is never
+    refused over an infrastructure hiccup, which would make a user's own history
+    unreachable. Preference order: the identity the workspace confirms for a
+    forwarded token, then the forwarded header, then a named fallback.
+
+    The one refusal: a forwarded token the workspace definitively REJECTS
+    (401/403) raises 401. Falling back to the header there would let anyone who
+    can reach the container pair a junk token with someone else's email.
     """
     if forwarded_token:
         verified = await _identity_from_token(forwarded_token)
+        if verified == _TOKEN_REJECTED:
+            from fastapi import HTTPException
+            raise HTTPException(status_code=401, detail="The forwarded user token was rejected.")
         if verified:
             return verified
+        # None = transient lookup failure: the header is still the platform's
+        # answer, so degrade to it rather than lock the user out.
 
     if forwarded_email:
         normalized = forwarded_email.strip().lower()

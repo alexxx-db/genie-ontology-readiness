@@ -23,7 +23,7 @@ _NO_CACHE = {"Cache-Control": "no-store, no-cache, must-revalidate", "Pragma": "
 
 from server.routes import router
 from server.routes._shared import _ai_model, DEFAULT_LLM_MODEL, is_available_model
-from server.config import USE_LAKEBASE
+from server.config import IS_DATABRICKS_APP, USE_LAKEBASE
 from server.security import (
     BodySizeLimitMiddleware,
     SecurityHeadersMiddleware,
@@ -60,12 +60,13 @@ async def lifespan(app: FastAPI):
     async def init_lakebase():
         if USE_LAKEBASE:
             from server.lakebase_client import init_pool, is_available
-            await init_pool()
+            # init_pool never raises: a pool or table failure leaves history
+            # cleanly disabled (retried later) instead of crashing startup.
+            try:
+                await init_pool()
+            except Exception as e:
+                logger.warning(f"Lakebase init failed: {e}")
             if is_available():
-                from server.snapshots import ensure_table as ensure_snapshots
-                from server.plans import ensure_table as ensure_plans
-                await ensure_snapshots()
-                await ensure_plans()
                 logger.info("Lakebase pool ready — assessment history + plans enabled")
             else:
                 logger.warning("Lakebase pool unavailable — history/plans disabled")
@@ -105,13 +106,15 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
     """Set per-request AI model from the X-AI-Model header."""
 
     async def dispatch(self, request: Request, call_next):
-        model = request.headers.get("X-AI-Model", DEFAULT_LLM_MODEL)
-        # Validate against the models the workspace actually serves (dynamic,
-        # cached) — NOT the static AI_MODELS label map, which only covers a few
-        # known families. Validating against the static map silently dropped
-        # every other live model back to the default.
-        if not await is_available_model(model):
-            model = DEFAULT_LLM_MODEL
+        model = DEFAULT_LLM_MODEL
+        # Only the plan routes call the LLM, so only they pay for the serving-
+        # endpoints lookup. Validate against the models the workspace actually
+        # serves (dynamic, cached) — NOT the static AI_MODELS label map, which
+        # only covers a few known families.
+        if request.url.path.startswith("/api/plan"):
+            requested = request.headers.get("X-AI-Model", DEFAULT_LLM_MODEL)
+            if await is_available_model(requested):
+                model = requested
         token = _ai_model.set(model)
         try:
             response = await call_next(request)
@@ -166,4 +169,6 @@ else:
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("DATABRICKS_APP_PORT", os.environ.get("PORT", 8000)))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    # Only a Databricks App sits behind the platform proxy; locally, don't expose
+    # the (identity-header-trusting) server to the LAN.
+    uvicorn.run(app, host="0.0.0.0" if IS_DATABRICKS_APP else "127.0.0.1", port=port)

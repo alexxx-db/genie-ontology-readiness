@@ -85,7 +85,7 @@ PILLARS = [
         "key": "genie_agents",
         "name": "Genie Agents",
         "weight": 16,
-        "short": "Curated Genie Agents with instructions, example SQL, and benchmarks.",
+        "short": "Genie Agents in use: agents present and recently active, from the audit log.",
         "capability": "genie_agents",
     },
     {

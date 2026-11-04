@@ -276,15 +276,19 @@ export default function Scorecard({
     const qs = include
       ? `?workspace_ids=${encodeURIComponent(wsFilter.workspace_ids.join(','))}&mode=include`
       : `?mode=${wsFilter.mode}`;
+    // Only the latest selection's response may land (an older, slower one is dropped).
+    let stale = false;
     setCatalogsLoading(true);
     apiGet<CatalogsResponse>(`/catalogs${qs}`)
       .then((r) => {
+        if (stale) return;
         setCatalogs(r.catalogs || []);
         setCatalogsAvailable(r.available);
         setCatFilter([]); // reset to no filter (empty = assess all) for the new workspace scope
       })
-      .catch(() => { setCatalogs([]); setCatalogsAvailable(false); })
-      .finally(() => setCatalogsLoading(false));
+      .catch(() => { if (!stale) { setCatalogs([]); setCatalogsAvailable(false); } })
+      .finally(() => { if (!stale) setCatalogsLoading(false); });
+    return () => { stale = true; };
   }, [wsFilter]);
 
   // Schema picker lists schemas only after the user picks exactly one catalog.
@@ -295,18 +299,22 @@ export default function Scorecard({
       setSchemaFilter('');
       return;
     }
+    let stale = false;
     setSchemasLoading(true);
     setSchemaFilter('');
     apiGet<SchemasResponse>(`/schemas?catalog=${encodeURIComponent(singleCatalog)}`)
       .then((r) => {
+        if (stale) return;
         setSchemas(r.schemas || []);
         setSchemasAvailable(r.available);
       })
       .catch(() => {
+        if (stale) return;
         setSchemas([]);
         setSchemasAvailable(false);
       })
-      .finally(() => setSchemasLoading(false));
+      .finally(() => { if (!stale) setSchemasLoading(false); });
+    return () => { stale = true; };
   }, [singleCatalog]);
 
   // The workspace the assessment is scoped to (the deployed workspace). Shown as a
@@ -351,6 +359,10 @@ export default function Scorecard({
 
   async function run() {
     if (phase === 'running') return;
+    // Cancel any in-flight stream / snapshot load so it can't write into this run.
+    abortRef.current?.abort();
+    const controller = new AbortController();
+    abortRef.current = controller;
     setError(null);
     setPillarsByKey({});
     setProgressByKey({});
@@ -358,8 +370,6 @@ export default function Scorecard({
     setTopGaps([]);
     setCurrentId(null);
     setPhase('running');
-    const controller = new AbortController();
-    abortRef.current = controller;
 
     const collected: Record<string, PillarScore> = {};
     let completed = false;
@@ -374,6 +384,7 @@ export default function Scorecard({
         undefined,
         controller.signal
       )) {
+        if (controller.signal.aborted) return;
         if (ev.type === 'pillar') {
           collected[ev.pillar.key] = ev.pillar;
           setPillarsByKey({ ...collected });
@@ -391,23 +402,30 @@ export default function Scorecard({
           setError(ev.error);
         }
       }
+      if (controller.signal.aborted) return;
       if (!completed) setPhase(Object.keys(collected).length > 0 ? 'done' : 'idle');
     } catch (e) {
-      if ((e as Error).name !== 'AbortError') {
+      if (!controller.signal.aborted) {
         setError((e as Error).message);
         setPhase(Object.keys(collected).length > 0 ? 'done' : 'idle');
       }
     } finally {
-      abortRef.current = null;
+      if (abortRef.current === controller) abortRef.current = null;
     }
   }
 
   async function loadSnapshot(id: number) {
     if (loadingId) return;
+    // Stop any in-flight run so its events can't mix into the loaded snapshot,
+    // and let a later run() cancel this load the same way.
+    abortRef.current?.abort();
+    const controller = new AbortController();
+    abortRef.current = controller;
     setLoadingId(id);
     setError(null);
     try {
       const res = await apiGet<SnapshotResponse>(`/assess/snapshot/${id}`);
+      if (controller.signal.aborted) return;
       const sc = res.scorecard;
       setPillarsByKey(Object.fromEntries(sc.pillars.map((p) => [p.key, p])));
       setOverall(sc.overall);
@@ -417,9 +435,12 @@ export default function Scorecard({
       setCurrentId(id);
       setPhase('done');
     } catch (e) {
+      if (controller.signal.aborted) return;
       setError((e as Error).message);
+      setPhase((p) => (p === 'running' ? 'idle' : p));
     } finally {
       setLoadingId(null);
+      if (abortRef.current === controller) abortRef.current = null;
     }
   }
 
@@ -464,7 +485,7 @@ export default function Scorecard({
                 <button
                   key={h.id}
                   onClick={() => loadSnapshot(Number(h.id))}
-                  disabled={loadingId != null}
+                  disabled={loadingId != null || running}
                   className={`w-full flex items-center gap-2.5 rounded-lg border px-3 py-2 text-left transition-colors ${
                     active ? 'border-databricks-400 bg-databricks-50' : 'border-transparent hover:bg-gray-50'
                   }`}

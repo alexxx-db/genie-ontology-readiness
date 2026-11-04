@@ -100,10 +100,11 @@ GENIE_SPACE_ID = os.environ.get("GENIE_SPACE_ID", "")
 # when no viewer token exists — which is the normal case unless the workspace has
 # enabled user authorization for the app.
 #
-# Default true preserves the previous behaviour exactly: fall back to the service
-# principal and answer the question. Set it to false to make the app decline
-# instead, for a deployment where viewers must never see more than their own
-# grants allow. Every fallback logs a warning naming the identity that served it.
+# Default false (the safe choice): with no viewer token the app declines rather
+# than answering as the service principal, so viewers never see more than their
+# own grants allow. Set it to true to restore the old behaviour of falling back to
+# the service principal. Every fallback logs a warning naming the identity that
+# served it.
 GENIE_ALLOW_SP_FALLBACK = os.environ.get("GENIE_ALLOW_SP_FALLBACK", "false").lower() == "true"
 
 # Cache workspace client to avoid repeated creation

@@ -131,7 +131,8 @@ def resolved_identity() -> Optional[dict]:
             "detail": "Read on-behalf-of-you; this signal reflects your own Unity Catalog grants."}
 
 
-async def execute_sql(query: str, parameters: Optional[dict[str, Any]] = None, force_sp: bool = False, record: bool = True) -> list[dict]:
+async def execute_sql(query: str, parameters: Optional[dict[str, Any]] = None, force_sp: bool = False,
+                      record: bool = True, allow_sp_fallback: bool = True) -> list[dict]:
     """Execute a SQL query against the Databricks SQL Warehouse.
 
     Identity model — every signal defaults to on-behalf-of-user (OBO):
@@ -146,6 +147,11 @@ async def execute_sql(query: str, parameters: Optional[dict[str, Any]] = None, f
       OBO identity, so the read runs as the SP directly.
     * The deploy-time ``FORCE_SP`` knob (config) forces SP-only mode for the whole
       app — OBO is never attempted — regardless of a forwarded token.
+
+    * ``allow_sp_fallback=False`` keeps an OBO read strictly as the viewer: a
+      denial is re-raised instead of retried as the SP. Use it for reads of a
+      scope the user chose themselves, where SP fallback would leak objects the
+      viewer has no grant on.
 
     NOTE: the SP fallback trades a little of the "reflects exactly what *you* can
     see" OBO promise for completeness — a viewer may see a signal via the SP that
@@ -176,7 +182,7 @@ async def execute_sql(query: str, parameters: Optional[dict[str, Any]] = None, f
     try:
         rows = await _execute_once(query, parameters, force_sp=False)
     except Exception as obo_err:
-        if not _is_authz_error(obo_err):
+        if not allow_sp_fallback or not _is_authz_error(obo_err):
             raise
         logger.warning(f"OBO read denied ({str(obo_err)[:160]}); falling back to app SP")
         try:
@@ -199,12 +205,14 @@ async def execute_sql(query: str, parameters: Optional[dict[str, Any]] = None, f
 # Substrings that mark a failure as an authorization/permission problem — the only
 # case where retrying as the app SP can succeed. Matched case-insensitively against
 # the SQL Warehouse / Statement Execution error text.
-_AUTHZ_MARKERS = (
+_DENIAL_MARKERS = (
     # Explicit permission / authorization denials.
     "permission_denied", "does not have", "not authorized", "access denied",
     "forbidden", "insufficient priv", "unauthorized", "no permission",
     "privilege",            # "requires ... privilege", "insufficient privileges" (narrower than bare "requires")
     "(401)", "(403)",       # HTTP status is wrapped as "SQL Warehouse error (403): ..." — no leading space
+)
+_NOT_FOUND_MARKERS = (
     # UC often surfaces a missing catalog/schema grant as the object simply not
     # existing (e.g. [TABLE_OR_VIEW_NOT_FOUND] "... cannot be found", "Catalog system
     # not found"). For the fixed system / information_schema probes here, not-found
@@ -213,6 +221,7 @@ _AUTHZ_MARKERS = (
     # Cover both the error-class tokens ("not_found", "does_not_exist") and the prose forms.
     "not found", "not_found", "cannot be found", "does not exist", "does_not_exist",
 )
+_AUTHZ_MARKERS = _DENIAL_MARKERS + _NOT_FOUND_MARKERS
 
 
 def _is_authz_error(exc: Exception) -> bool:
